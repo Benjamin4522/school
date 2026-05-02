@@ -1,0 +1,8 @@
+node_modules/
+.next/
+tsconfig.tsbuildinfo
+*.db
+*.db-journal
+.zscripts/
+.env
+.env.local
