@@ -1,0 +1,399 @@
+# ============================================================================
+# Beulrock CoreEngineExecutor — GitHub Actions CI/CD Pipeline
+# ============================================================================
+#
+# This workflow builds the C++ engine on multiple platforms, runs tests,
+# creates release artifacts, and integrates with the Next.js deployment.
+#
+# Triggers:
+#   - Push to main/develop branches
+#   - Pull requests to main
+#   - Manual dispatch
+#   - Tag pushes (v*.*.*) for releases
+#
+# Jobs:
+#   1. build-linux   - Build on Ubuntu (g++ + OpenSSL)
+#   2. build-windows - Build on Windows (MSVC + OpenSSL)
+#   3. build-macos   - Build on macOS (Clang + OpenSSL)
+#   4. test          - Run C++ unit tests
+#   5. benchmark     - Performance benchmarking
+#   6. release       - Create GitHub Release with artifacts
+#   7. deploy-nextjs - Build and deploy Next.js app
+#
+# ============================================================================
+
+name: Beulrock Engine CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'core-engine/**'
+      - '.github/workflows/build-engine.yml'
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'core-engine/**'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (Release/Debug)'
+        required: false
+        default: 'Release'
+      run_benchmark:
+        description: 'Run benchmarks'
+        required: false
+        default: 'true'
+
+env:
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+  ENGINE_VERSION: '2.0.0'
+
+# ── Cancel redundant runs ──
+concurrency:
+  group: engine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ══════════════════════════════════════════════════════════════
+  # Job 1: Build on Linux (Ubuntu)
+  # ══════════════════════════════════════════════════════════════
+  build-linux:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libssl-dev \
+            clang
+
+      - name: Configure CMake (GCC)
+        if: matrix.compiler == 'gcc'
+        run: |
+          cd core-engine
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DBUILD_TESTS=ON
+
+      - name: Configure CMake (Clang)
+        if: matrix.compiler == 'clang'
+        run: |
+          cd core-engine
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: |
+          cd core-engine/build
+          make -j$(nproc)
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: beulrock-engine-linux-${{ matrix.compiler }}
+          path: core-engine/build/beulrock-engine
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════
+  # Job 2: Build on Windows
+  # ══════════════════════════════════════════════════════════════
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenSSL
+        run: |
+          choco install openssl -y
+          echo "OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL-Win64" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Configure CMake
+        run: |
+          cd core-engine
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DBUILD_TESTS=OFF
+
+      - name: Build
+        run: |
+          cd core-engine/build
+          cmake --build . --config ${{ env.BUILD_TYPE }}
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: beulrock-engine-windows
+          path: core-engine/build/${{ env.BUILD_TYPE }}/beulrock-engine.exe
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════
+  # Job 3: Build on macOS
+  # ══════════════════════════════════════════════════════════════
+  build-macos:
+    name: Build macOS ARM64
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install openssl cmake
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl)" >> $GITHUB_ENV
+
+      - name: Configure CMake
+        run: |
+          cd core-engine
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl) \
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: |
+          cd core-engine/build
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: beulrock-engine-macos
+          path: core-engine/build/beulrock-engine
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════
+  # Job 4: Run Tests
+  # ══════════════════════════════════════════════════════════════
+  test:
+    name: Run C++ Unit Tests
+    runs-on: ubuntu-latest
+    needs: [build-linux]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+
+      - name: Configure with tests
+        run: |
+          cd core-engine
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=ON -DENABLE_ASAN=ON
+
+      - name: Build
+        run: |
+          cd core-engine/build
+          make -j$(nproc)
+
+      - name: Run tests
+        run: |
+          cd core-engine/build
+          ctest --output-on-failure --verbose
+
+      - name: Test execution pipeline
+        run: |
+          cd core-engine/build
+          echo '{"action":"execute","jobId":"test_001","userId":"user_test","gameId":"game_001","script":"print(\"Hello from C++ Engine\")","tier":"free"}' | ./beulrock-engine --stdin
+
+      - name: Test validation
+        run: |
+          cd core-engine/build
+          echo '{"action":"validate","script":"local x = 1; return x"}' | ./beulrock-engine --stdin
+
+      - name: Test health check
+        run: |
+          cd core-engine/build
+          echo '{"action":"health"}' | ./beulrock-engine --stdin
+
+  # ══════════════════════════════════════════════════════════════
+  # Job 5: Performance Benchmark
+  # ══════════════════════════════════════════════════════════════
+  benchmark:
+    name: Performance Benchmark
+    runs-on: ubuntu-latest
+    needs: [build-linux]
+    if: github.event.inputs.run_benchmark == 'true' || startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+
+      - name: Build Release
+        run: |
+          cd core-engine
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Run Benchmark
+        run: |
+          cd core-engine/build
+          echo '{"action":"benchmark"}' | ./beulrock-engine --stdin > benchmark_results.json
+          cat benchmark_results.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: core-engine/build/benchmark_results.json
+          retention-days: 90
+
+  # ══════════════════════════════════════════════════════════════
+  # Job 6: Create Release (on tag push)
+  # ══════════════════════════════════════════════════════════════
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-windows, build-macos, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          cp artifacts/beulrock-engine-linux-gcc/beulrock-engine release-assets/beulrock-engine-linux-x86_64
+          cp artifacts/beulrock-engine-linux-clang/beulrock-engine release-assets/beulrock-engine-linux-x86_64-clang
+          cp artifacts/beulrock-engine-windows/beulrock-engine.exe release-assets/beulrock-engine-windows-x64.exe
+          cp artifacts/beulrock-engine-macos/beulrock-engine release-assets/beulrock-engine-macos-arm64
+          chmod +x release-assets/beulrock-engine-*
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "Beulrock CoreEngine v${{ env.ENGINE_VERSION }}"
+          body: |
+            ## Beulrock CoreEngineExecutor v${{ env.ENGINE_VERSION }}
+
+            ### Features
+            - C++17 high-performance execution engine
+            - HMAC-SHA256 cryptographic signing (OpenSSL)
+            - Multi-threaded concurrent execution (thread pool)
+            - Circuit breaker pattern for fault tolerance
+            - State machine execution pipeline
+            - Memory-efficient script processing
+            - Anti-replay protection (30s window)
+            - Tier-based access control
+            - JSON I/O for Node.js integration
+
+            ### Binaries
+            | File | Platform | Compiler |
+            |------|----------|----------|
+            | `beulrock-engine-linux-x86_64` | Linux x86_64 | GCC |
+            | `beulrock-engine-linux-x86_64-clang` | Linux x86_64 | Clang |
+            | `beulrock-engine-windows-x64.exe` | Windows x64 | MSVC |
+            | `beulrock-engine-macos-arm64` | macOS ARM64 | Clang |
+
+            ### Usage
+            ```bash
+            chmod +x beulrock-engine-linux-x86_64
+            echo '{"action":"health"}' | ./beulrock-engine-linux-x86_64 --stdin
+            ```
+
+            ### Verification
+            Verify checksums with: `sha256sum -c checksums-sha256.txt`
+          draft: false
+          prerelease: false
+          files: |
+            release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ══════════════════════════════════════════════════════════════
+  # Job 7: Next.js Build Verification
+  # ══════════════════════════════════════════════════════════════
+  build-nextjs:
+    name: Verify Next.js Build
+    runs-on: ubuntu-latest
+    needs: [build-linux]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download C++ engine
+        uses: actions/download-artifact@v4
+        with:
+          name: beulrock-engine-linux-gcc
+          path: core-engine/bin/
+
+      - name: Make engine executable
+        run: chmod +x core-engine/bin/beulrock-engine
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Build Next.js
+        run: npm run build
+        env:
+          DATABASE_URL: postgresql://dummy:dummy@localhost:5432/dummy
+          REDIS_URL: redis://localhost:6379
+
+      - name: Verify C++ engine integration
+        run: |
+          echo '{"action":"health"}' | ./core-engine/bin/beulrock-engine --stdin
+          echo '{"action":"benchmark"}' | ./core-engine/bin/beulrock-engine --stdin
